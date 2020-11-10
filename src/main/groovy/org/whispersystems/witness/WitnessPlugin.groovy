@@ -3,6 +3,8 @@ package org.whispersystems.witness
 import org.gradle.api.InvalidUserDataException
 import org.gradle.api.Plugin
 import org.gradle.api.Project
+import org.gradle.api.artifacts.Configuration
+import org.gradle.api.artifacts.component.ModuleComponentSelector
 
 import java.security.MessageDigest
 
@@ -32,33 +34,43 @@ class WitnessPlugin implements Plugin<Project> {
         return new DependencyKey(parts[0], parts[1], parts[2], parts[4])
     }
 
+    /**
+     * Finds any direct dependencies of the given configuration that are modules and
+     * returns a set of files belonging to those dependencies.
+     */
+    static Set<File> findDirectModuleDependencies(Configuration cfg) {
+        def modules = new HashSet<>()
+        cfg.incoming.resolutionResult.root.dependencies.each {
+            if (it.requested instanceof ModuleComponentSelector) {
+                def mod = it.requested
+                modules.add "${mod.group}:${mod.module}:${mod.version}".toString()
+            }
+        }
+        return cfg.files {
+            modules.contains "${it.group}:${it.name}:${it.version}".toString()
+        }
+    }
+
     static Map<DependencyKey, String> calculateHashes(Project project) {
         def excludedProp = project.properties.get('noWitness')
         def excluded = excludedProp == null ? [] : excludedProp.split(',')
-        def projectPath = project.file('.').canonicalPath
-        def dependencies = new TreeMap<DependencyKey, String>()
+        def dependencies = new TreeMap<>()
         def addDependencies = {
             // Skip excluded configurations and their subconfigurations
             def scopedName = "${project.name}:${it.name}"
-            it.hierarchy.each {
+            if (it.hierarchy.any {
                 def superScopedName = "${project.name}:${it.name}"
-                if (excluded.contains(it.name) || excluded.contains(superScopedName)) {
-                    println "Skipping excluded configuration ${scopedName}"
-                    return
-                }
+                excluded.contains(it.name) || excluded.contains(superScopedName)
+            }) {
+                println "Skipping excluded configuration $scopedName"
+                return
             }
             // Skip unresolvable configurations
-            if (it.metaClass.respondsTo(it, 'isCanBeResolved') ? it.isCanBeResolved() : true) {
-                it.fileCollection { dep ->
-                    // Skip dependencies on other projects
-                    dep.version != 'unspecified'
-                }.each {
-                    // Skip files within project directory
-                    if (!it.canonicalPath.startsWith(projectPath)) {
-                        def key = makeKey it.path
-                        if (!dependencies.containsKey(key))
-                            dependencies.put key, calculateSha256(it)
-                    }
+            if (!it.metaClass.respondsTo(it, 'isCanBeResolved') || it.canBeResolved) {
+                findDirectModuleDependencies(it).each {
+                    def key = makeKey it.path
+                    if (!dependencies.containsKey(key))
+                        dependencies.put key, calculateSha256(it)
                 }
             }
         }
@@ -68,25 +80,18 @@ class WitnessPlugin implements Plugin<Project> {
     }
 
     static Map<String, ConfigurationInfo> findDependencies(Project project) {
-        def projectPath = project.file('.').canonicalPath
-        def dependencies = new TreeMap<String, List<String>>()
+        def dependencies = new TreeMap<>()
         def addDependencies = {
             // Skip unresolvable configurations
-            if (it.metaClass.respondsTo(it, 'isCanBeResolved') ? it.isCanBeResolved() : true) {
+            if (!it.metaClass.respondsTo(it, 'isCanBeResolved') || it.canBeResolved) {
                 def superConfigurations = new ArrayList<>()
                 it.hierarchy.each { sup ->
                     if (sup.name != it.name) superConfigurations.add(sup.name)
                 }
                 def configDependencies = new ArrayList<>()
-                it.fileCollection { dep ->
-                    // Skip dependencies on other projects
-                    dep.version != 'unspecified'
-                }.each {
-                    // Skip files within project directory
-                    if (!it.canonicalPath.startsWith(projectPath)) {
-                        def hash = calculateSha256 it
-                        configDependencies.add("${makeKey(it.path)}:${hash}".toString())
-                    }
+                findDirectModuleDependencies(it).each {
+                    def hash = calculateSha256 it
+                    configDependencies.add("${makeKey(it.path)}:$hash".toString())
                 }
                 Collections.sort configDependencies
                 def key = "${project.name}:${it.name}".toString()
@@ -106,14 +111,14 @@ class WitnessPlugin implements Plugin<Project> {
             project.dependencyVerification.verify.each { assertion ->
                 def parts = assertion.tokenize(":")
                 if (parts.size() != 5) {
-                    throw new InvalidUserDataException("Invalid or obsolete integrity assertion '${assertion}'")
+                    throw new InvalidUserDataException("Invalid or obsolete integrity assertion '$assertion'")
                 }
                 def (group, name, version, file, expectedHash) = parts
                 def key = new DependencyKey(group, name, version, file)
                 println "Verifying ${key.all}"
                 def hash = dependencies.get key
                 if (hash == null) {
-                    throw new InvalidUserDataException("No dependency for integrity assertion '${assertion}'")
+                    throw new InvalidUserDataException("No dependency for integrity assertion '$assertion'")
                 }
                 if (hash != expectedHash) {
                     throw new InvalidUserDataException("Checksum failed for ${key.all}")
@@ -135,9 +140,9 @@ class WitnessPlugin implements Plugin<Project> {
             dependencies.each {
                 println "${it.key}:"
                 println "    superconfigurations:"
-                it.value.superConfigurations.each { println "        ${it}" }
+                it.value.superConfigurations.each { println "        $it" }
                 println "    dependencies:"
-                it.value.dependencies.each { println "        ${it}" }
+                it.value.dependencies.each { println "        $it" }
             }
         }
     }
@@ -151,7 +156,7 @@ class WitnessPlugin implements Plugin<Project> {
             this.name = name
             this.version = version
             this.file = file
-            all = "${group}:${name}:${version}:${file}".toString()
+            all = "$group:$name:$version:$file".toString()
         }
 
         @Override
@@ -172,7 +177,7 @@ class WitnessPlugin implements Plugin<Project> {
 
         @Override
         String toString() {
-            return "${group}:${name}:${version}"
+            return "$group:$name:$version".toString()
         }
     }
 
